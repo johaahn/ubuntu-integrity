@@ -88,6 +88,7 @@ def ByteToHex( byteStr ):
 path = '/usr/local/cuda'
 class binary_checker:
     def __init__(self, args):
+        self.archive_url = "http://fr.archive.ubuntu.com/ubuntu"
         self.config = {}
         self.config['Files']={}
         self.config['Exec']={}
@@ -96,11 +97,59 @@ class binary_checker:
 
         db = dbm.ndbm.open('cache', 'c')
         self.db = db
+        self.db_archive = None
+
 
         release = execute("lsb_release -c -s")
         if not release:
             os.exit(-1)
         self.release = release.rstrip()
+
+    def init_archive_db(self):
+        self.db_archive = dbm.ndbm.open('archive', 'n')
+
+        tmppath = tempfile.mkdtemp()
+        origpath = os.getcwd()
+        os.chdir(tmppath)
+        #print(tmppath)
+        try:
+            resapt = execute("wget %s/ls-lR.gz"%(self.archive_url))
+            if resapt == None:
+                raise Exception("Unable to download archive db")
+
+            resapt = execute("gunzip ls-lR.gz")
+            if resapt == None:
+                raise Exception("Unable to unzip db")
+
+            filepath = 'ls-lR'
+            with open(filepath) as fp:
+               line = fp.readline()
+               path = None
+               while line:
+                   line = line.rstrip()
+                   #print(line)
+                   if line.endswith(':'):
+                       path = line.split(':')[0]
+                   if line.endswith('.deb'):
+                       file = line.split(' ')[-1]
+                       fullpath = '/'.join([self.archive_url,path.replace('./',''),file])
+                       #print(file, fullpath)
+                       self.db_archive[file] = fullpath
+                   #print("Line {}: {}".format(cnt, line.strip()))
+                   line = fp.readline()
+
+
+            shutil.rmtree(tmppath)
+
+        except Exception as e:
+            print(e)
+            print("ERROR during validation")
+            os.exit(-1)
+        finally:
+            print("removing %s"%(tmppath))
+            os.chdir(origpath)
+
+
 
     def generate_key(self, execfile, dictFile):
         #print(execfile, dictFile)
@@ -110,33 +159,45 @@ class binary_checker:
     def add_error(self, file, cause):
         self.errors.append((file, cause))
         print("ERROR", file, cause)
-        os.exit(-1)
 
 
     def validate_config(self):
+        self.db_archive = dbm.ndbm.open('archive', 'r')
+
+        self.ignore_list = ['/etc/ld.so.cache']
         self.errors = []
-        for execfile in self.config['Exec']:
-            dictFile = self.config['Exec'][execfile]
-            print("CHECKING", execfile,dictFile ,"...")
-            if 'version' in dictFile:
-                key=self.generate_key(execfile,dictFile)
-                need_validation = True
+        listCheck = [self.config['Exec'],self.config['Libs']]
+        for list_ in listCheck:
+            for filer_ in list_:
+                dictFile = list_[filer_]
+                file_ = dictFile['readlink']
 
-                if key in self.db:
-                    need_validation = False
+                print("CHECKING", file_,dictFile ,"...")
 
-                if need_validation:
-                    self.validate_file(execfile,dictFile)
-                    # second pass after package reading
-                    if key not in self.db:
-                        self.add_error(execfile, "File not found in package")
-                        continue
-
-                if self.db[key].decode('utf-8') != dictFile['hash']:
-                    self.add_error(execfile, "File not match md5 (%s!=%s)"%(dictFile['hash'],self.db[key]))
+                if file_ in self.ignore_list:
                     continue
 
-                print("GOOD")
+                if 'version' in dictFile:
+                    key=self.generate_key(file_,dictFile)
+                    need_validation = True
+
+                    if key in self.db:
+                        need_validation = False
+
+                    if need_validation:
+                        self.validate_file(file_,dictFile)
+                        # second pass after package reading
+                        if key not in self.db:
+                            self.add_error(file_, "File not found in package")
+                            continue
+
+                    if self.db[key].decode('utf-8') != dictFile['hash']:
+                        self.add_error(file_, "File not match md5 (%s!=%s)"%(dictFile['hash'],self.db[key]))
+                        continue
+
+                    print("GOOD")
+        for (file,cause) in (self.errors):
+            print(file,cause)
 
 
     def insert_base(self, execfile, dictfile):
@@ -145,6 +206,29 @@ class binary_checker:
         #if key not in self.db:
         #    self.db[key] = []
         self.db[key] = dictfile['hash']
+
+    def validate_debfile(self,debfile, execfile, dictfile):
+        resmd5 = execute("dpkg -I ./%s md5sums"%(debfile))
+
+        if resmd5 != None:
+            listmd5 = resmd5.split('\n')
+            for md5 in listmd5:
+                print(md5)
+                filetmplist = md5.split()
+                if len(filetmplist) >= 2:
+                    md5tmp = filetmplist[0].upper()
+                    filetmp = '/'+filetmplist[1]
+                    print(filetmp, md5tmp, execfile)
+                    if filetmp == execfile:
+                        dictNew = {}
+                        dictNew['version'] = dictfile['version']
+                        dictNew['package'] = dictfile['package']
+                        dictNew['arch'] = dictfile['arch']
+                        dictNew['release'] = dictfile['release']
+                        dictNew['file'] = execfile
+                        dictNew['hash'] = md5tmp
+                        self.insert_base(execfile,dictfile)
+                        break
 
     def validate_file(self, execfile, dictfile):
         validate = False
@@ -155,32 +239,31 @@ class binary_checker:
         os.chdir(tmppath)
         #print(tmppath)
         try:
-            resapt = execute("apt download %s=%s"%(dictfile['package'],dictfile['version']))
-            #print("apt",resapt)
-            #print(execute("ls -la"))
-            if resapt != None:
+            #resapt = execute("apt download %s=%s"%(dictfile['package'],dictfile['version']))
+            #if resapt != None:
+            #    version = dictfile['version']
+            #    version = version.replace(':','%3a')
+            #    debfile = "%s_%s_%s.deb"%(dictfile['package'],version,dictfile['arch'])
+            #    self.validate_debfile(debfile, execfile, dictfile)
+            #else:
+            if 1:
                 version = dictfile['version']
-                version = version.replace(':','%3a')
-                debfile = "%s_%s_%s.deb"%(dictfile['package'],version,dictfile['arch'])
-                resmd5 = execute("dpkg -I ./%s md5sums"%(debfile))
-                #print("apt",resmd5)
-                if resmd5 != None:
-                    listmd5 = resmd5.split('\n')
-                    for md5 in listmd5:
-                        filetmplist = md5.split()
-                        md5tmp = filetmplist[0].upper()
-                        filetmp = '/'+filetmplist[1]
-                        #print(filetmp,md5tmp,execfile)
-                        if filetmp == execfile:
-                            dictNew = {}
-                            dictNew['version'] = dictfile['version']
-                            dictNew['package'] = dictfile['package']
-                            dictNew['arch'] = dictfile['arch']
-                            dictNew['release'] = dictfile['release']
-                            dictNew['file'] = execfile
-                            dictNew['hash'] = md5tmp
-                            self.insert_base(execfile,dictfile)
-                            break
+                if ':' in version:
+                    version = version.split(':')[1]
+                package = dictfile['package']
+                if ':' in package:
+                    package = package.split(':')[0]
+                debfile = "%s_%s_%s.deb"%(package,version,dictfile['arch'])
+
+                if debfile in self.db_archive:
+                    resapt = execute("wget %s"%(self.db_archive[debfile].decode('utf-8')))
+                    print("TRY", resapt)
+                    if resapt != None:
+                        self.validate_debfile(debfile, execfile, dictfile)
+                else:
+                    print("%s no in db archive"%(debfile))
+
+
 
             shutil.rmtree(tmppath)
         except Exception as e:
@@ -289,9 +372,10 @@ def main(argv):
    args['statefile'] = '/tmp/system-footprint.json'
    args['check_exe'] = False
    args['validate_db'] = False
+   args['update_archive_db'] = False
    args['limit'] = None
    try:
-      opts, args_ = getopt.getopt(argv,"ha:i:b:s:gvl",["ifile=","statefile=","dbfile=","generate-state","validate-state","limit"])
+      opts, args_ = getopt.getopt(argv,"ha:i:b:s:gvlu",["ifile=","statefile=","dbfile=","generate-state","validate-state","limit","update"])
    except getopt.GetoptError:
       usage()
    for opt, arg in opts:
@@ -307,6 +391,8 @@ def main(argv):
          args['check_exe'] = True
       elif opt in ("-v", "--validate-state"):
          args['validate_db'] = True
+      elif opt in ("-u", "--update"):
+         args['update_archive_db'] = True
       elif opt in ("-l", "--limit-state"):
          args['limit'] = 10
 
@@ -332,6 +418,10 @@ def main(argv):
            a.read_config_file()
            a.validate_config()
            sys.exit(0)
+   elif args['update_archive_db']:
+        a=binary_checker(args)
+        a.init_archive_db()
+        sys.exit(0)
    else:
         usage()
 
