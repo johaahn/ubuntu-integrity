@@ -10,6 +10,7 @@ import re
 import configparser
 import tempfile
 import shutil
+from datetime import datetime
 
 def hash_bytestr_iter(bytesiter, hasher, ashexstr=False):
     for block in bytesiter:
@@ -90,9 +91,10 @@ class binary_checker:
     def __init__(self, args):
         self.archive_url = "http://fr.archive.ubuntu.com/ubuntu"
         self.config = {}
-        self.config['Files']={}
-        self.config['Exec']={}
-        self.config['Libs']={}
+        now = datetime.now()
+        self.config['date'] = now.strftime("%d/%m/%Y %H:%M:%S")
+        self.config['uname']=os.uname()
+        self.config['files']={}
         self.args = args
 
         db = dbm.ndbm.open('cache', 'c')
@@ -166,7 +168,7 @@ class binary_checker:
 
         self.ignore_list = ['/etc/ld.so.cache']
         self.errors = []
-        listCheck = [self.config['Exec'],self.config['Libs']]
+        listCheck = [self.config['files']]
         for list_ in listCheck:
             for filer_ in list_:
                 dictFile = list_[filer_]
@@ -178,6 +180,10 @@ class binary_checker:
                     continue
 
                 if 'version' in dictFile:
+                    if dictFile['version'] == None:
+                        self.add_error(file_, "File not found in system packages")
+                        continue
+
                     key=self.generate_key(file_,dictFile)
                     need_validation = True
 
@@ -207,9 +213,28 @@ class binary_checker:
         #    self.db[key] = []
         self.db[key] = dictfile['hash']
 
-    def validate_debfile(self,debfile, execfile, dictfile):
-        resmd5 = execute("dpkg -I ./%s md5sums"%(debfile))
 
+    def validate_debfile(self,debfile, execfile, dictfile):
+        resextract = execute("dpkg-deb -x ./%s ./"%(debfile))
+        if resextract != None:
+            #execute("ls -lR", True)
+            localfile = "."+execfile
+            if os.access(localfile, os.R_OK):
+                md5tmp = get_md5(localfile)
+                if md5tmp:
+                    dictNew = {}
+                    dictNew['version'] = dictfile['version']
+                    dictNew['package'] = dictfile['package']
+                    dictNew['arch'] = dictfile['arch']
+                    dictNew['release'] = dictfile['release']
+                    dictNew['file'] = execfile
+                    dictNew['hash'] = md5tmp
+                    self.insert_base(execfile,dictfile)
+
+
+    def validate_debfile_old(self,debfile, execfile, dictfile):
+        resmd5 = execute("dpkg -I ./%s md5sums"%(debfile))
+        sys.exit(-1)
         if resmd5 != None:
             listmd5 = resmd5.split('\n')
             for md5 in listmd5:
@@ -317,7 +342,7 @@ class binary_checker:
         file_cnt = 0
         for file in listf:
             print(file)
-            self.config['Files'][str(file)] = self.generate_dict(file)
+            self.config['files'][str(file)] = self.generate_dict(file)
             file_cnt += 1
             if self.args['limit'] and file_cnt > self.args['limit']:
                 break
@@ -326,7 +351,7 @@ class binary_checker:
         listf = list_of_exec(folder)
         file_cnt = 0
         for file in listf:
-            self.config['Exec'][str(file)]=self.generate_dict(file)
+            self.config['files'][str(file)]=self.generate_dict(file)
             file_cnt += 1
             if self.args['limit'] and file_cnt > self.args['limit']:
                 break
@@ -340,7 +365,7 @@ class binary_checker:
         ld_list = m
         for file in ld_list:
             ret = execute("readlink -f \"%s\""%(file)).rstrip()
-            self.config['Libs'][str(file)] = self.generate_dict(ret)
+            self.config['files'][str(file)] = self.generate_dict(ret)
 
             file_cnt += 1
             if self.args['limit'] and file_cnt > self.args['limit']:
@@ -368,14 +393,13 @@ def usage():
 def main(argv):
    args = {}
    args['inputfile'] = ''
-   args['dbfile'] = ''
-   args['statefile'] = '/tmp/system-footprint.json'
-   args['check_exe'] = False
-   args['validate_db'] = False
-   args['update_archive_db'] = False
+   args['statefile'] = './state.json'
+   args['check'] = False
+   args['validate'] = False
+   args['update_archive'] = False
    args['limit'] = None
    try:
-      opts, args_ = getopt.getopt(argv,"ha:i:b:s:gvlu",["ifile=","statefile=","dbfile=","generate-state","validate-state","limit","update"])
+      opts, args_ = getopt.getopt(argv,"ha:i:s:gvlu",["ifile=","statefile=","generate-state","validate-state","limit","update"])
    except getopt.GetoptError:
       usage()
    for opt, arg in opts:
@@ -385,21 +409,19 @@ def main(argv):
          args['inputfile'] = arg
       elif opt in ("-s", "--statefile"):
          args['statefile'] = arg
-      elif opt in ("-b", "--dbfile"):
-         args['dbfile'] = arg
       elif opt in ("-g", "--generate-state"):
-         args['check_exe'] = True
+         args['check'] = True
       elif opt in ("-v", "--validate-state"):
-         args['validate_db'] = True
+         args['validate'] = True
       elif opt in ("-u", "--update"):
-         args['update_archive_db'] = True
+         args['update'] = True
       elif opt in ("-l", "--limit-state"):
          args['limit'] = 10
 
    print("ARGS:",args)
 
    a=binary_checker(args)
-   if args['check_exe']:
+   if args['check']:
        if not args['statefile']:
            usage()
        a.check_file('/etc')
@@ -410,7 +432,7 @@ def main(argv):
        a.write_config_file()
        sys.exit(0)
 
-   elif args['validate_db']:
+   elif args['validate']:
        if not args['statefile']:
            usage()
        else:
@@ -418,7 +440,7 @@ def main(argv):
            a.read_config_file()
            a.validate_config()
            sys.exit(0)
-   elif args['update_archive_db']:
+   elif args['update']:
         a=binary_checker(args)
         a.init_archive_db()
         sys.exit(0)
