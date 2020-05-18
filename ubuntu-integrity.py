@@ -1,5 +1,5 @@
 #!/usr/bin/python
-
+import gzip
 import sys, getopt
 import os
 import mimetypes
@@ -10,12 +10,19 @@ import re
 import configparser
 import tempfile
 import shutil
+import pwd
+import grp
 from datetime import datetime
 
-def hash_bytestr_iter(bytesiter, hasher, ashexstr=False):
+def hash_bytestr_iter(bytesiter, hasherList, ashexstr=False):
     for block in bytesiter:
-        hasher.update(block)
-    return hasher.hexdigest() if ashexstr else hasher.digest()
+        for hasher in hasherList:
+            hasher.update(block)
+    hashResult = []
+    for hasher in hasherList:
+        hashResult.append(hasher.digest())
+
+    return hashResult
 
 def file_as_blockiter(afile, blocksize=65536):
     with afile:
@@ -57,11 +64,12 @@ def list_of_exec(path):
     return files
 
 def get_md5(file_):
-    md5res = hash_bytestr_iter(file_as_blockiter(open(file_, 'rb')), hashlib.md5())
-    return md5res
+    md5res = hash_bytestr_iter(file_as_blockiter(open(file_, 'rb')), [hashlib.md5(), hashlib.sha1()])
+    md5dict = {'md5':ByteToHex(md5res[0]), 'sha1':ByteToHex(md5res[1])}
+    return md5dict
 
 def execute(cmd, display=False):
-    print('Executing',cmd)
+    #print('Executing',cmd)
     import subprocess
     #result = subprocess.run(cmd.split(' '), stdout=subprocess.PIPE)
     cmd = ['bash','-c',cmd]
@@ -194,11 +202,11 @@ class binary_checker:
                         self.validate_file(file_,dictFile)
                         # second pass after package reading
                         if key not in self.db:
-                            self.add_error(file_, "File not found in package")
+                            self.add_error(file_, "File not found in hash database")
                             continue
 
                     if self.db[key].decode('utf-8') != dictFile['hash']:
-                        self.add_error(file_, "File not match md5 (%s!=%s)"%(dictFile['hash'],self.db[key]))
+                        self.add_error(file_, "File not match hash (%s!=%s)"%(dictFile['hash'],self.db[key]))
                         continue
 
                     print("GOOD")
@@ -308,10 +316,26 @@ class binary_checker:
         arch = None
 
         retfile = execute("readlink -f \"%s\""%(file)).rstrip()
-        md5tmp = b'00000000'
-        if not retfile.startswith("/proc"):
-            md5tmp = get_md5(retfile)
+        md5tmp = {}
+        b_check_dpkg = True
+        stat_info = None
 
+        for syspath in ['/proc','/sys','/dev']:
+            if retfile.startswith(syspath):
+                b_check_dpkg = False
+
+        #Get stat info
+        try:
+            stat_info = os.stat(retfile)
+        except:
+            try:
+                stat_info = os.stat(file)
+            except:
+                stat_info = None
+
+        if b_check_dpkg:
+            #Get md5
+            md5tmp = get_md5(retfile)
             #print(file, ByteToHex(md5tmp))
             ec = execute("dpkg -S %s"%retfile)
             if ec:
@@ -334,7 +358,27 @@ class binary_checker:
                             arch = m.group('arch')
                             #print(arch)
 
-        dict_ = {'hash':ByteToHex(md5tmp), 'package':pckg, 'version':version, 'arch':arch, 'release':self.release, 'readlink':retfile}
+
+        dict_ = {
+            'hash':md5tmp,
+            'package':pckg,
+            'version':version,
+            'arch':arch,
+            'release':self.release,
+            'readlink':retfile,
+            }
+
+        if stat_info:
+            timestamp_mtime = datetime.fromtimestamp(stat_info.st_mtime).strftime('%Y-%m-%d-%H:%M')
+            timestamp_ctime = datetime.fromtimestamp(stat_info.st_ctime).strftime('%Y-%m-%d-%H:%M')
+
+            dict_['stat-mode']=oct(stat_info.st_mode)
+            dict_['stat-user']=str(pwd.getpwuid(stat_info.st_uid).pw_name)
+            dict_['stat-group']=str(grp.getgrgid(stat_info.st_gid).gr_name)
+            dict_['stat-size']=str(stat_info.st_size)
+            dict_['stat-mtime']=timestamp_mtime
+            dict_['stat-ctime']=timestamp_ctime
+
         print(dict_)
         return dict_
     def check_file(self, folder):
@@ -371,18 +415,46 @@ class binary_checker:
             if self.args['limit'] and file_cnt > self.args['limit']:
                 break
 
-    def write_config_file(self):
+    def dump_object(self, object, layer=0):
+        #print(layer)
+        for ii_layer in range(layer):
+            print(" ", end='')
+
+
+        if type(object) is list:
+            print(type(object), len(object))
+            for child in object:
+                self.dump_object(child, layer+1)
+        elif type(object) is dict:
+            print(type(object), len(object))
+            for k,v in object.items():
+                print(k)
+                self.dump_object(v, layer+1)
+
+        else:
+
+            if not object:
+                print(type(object), "None")
+            else:
+                print(type(object), len(object), object)
+
+            if type(object) is bytes:
+                print ("ASSERT BYTES")
+                sys.exit(-1)
+
+    def write_state_file(self):
         statefile = self.args['statefile']
+        self.dump_object(self.config)
         print("Writing to %s"%(statefile))
         import json
-        with open(statefile, 'w') as fp:
+        with gzip.open(statefile, 'wt') as fp:
             json.dump(self.config, fp, sort_keys=True, indent=4)
 
-    def read_config_file(self):
+    def read_state_file(self):
         statefile = self.args['statefile']
         print("Reading from %s"%(statefile))
         import json
-        with open(statefile, 'r') as fp:
+        with gzip.open(statefile, 'rt') as fp:
             self.config = json.load(fp)
 
 def usage():
@@ -393,9 +465,10 @@ def usage():
 def main(argv):
    args = {}
    args['inputfile'] = ''
-   args['statefile'] = './state.json'
+   args['statefile'] = './state.json.gz'
    args['check'] = False
    args['validate'] = False
+   args['update'] = False
    args['update_archive'] = False
    args['limit'] = None
    try:
@@ -416,7 +489,7 @@ def main(argv):
       elif opt in ("-u", "--update"):
          args['update'] = True
       elif opt in ("-l", "--limit-state"):
-         args['limit'] = 10
+         args['limit'] = 20
 
    print("ARGS:",args)
 
@@ -425,11 +498,11 @@ def main(argv):
        if not args['statefile']:
            usage()
        a.check_file('/etc')
-       a.check_file('/boot')
-       a.check_exec('/bin')
-       a.check_exec('/usr/bin')
-       a.check_ld()
-       a.write_config_file()
+       #a.check_file('/boot')
+       #a.check_exec('/bin')
+       #a.check_exec('/usr/bin')
+       #a.check_ld()
+       a.write_state_file()
        sys.exit(0)
 
    elif args['validate']:
@@ -437,7 +510,7 @@ def main(argv):
            usage()
        else:
            a=binary_checker(args)
-           a.read_config_file()
+           a.read_state_file()
            a.validate_config()
            sys.exit(0)
    elif args['update']:
